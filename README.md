@@ -153,7 +153,7 @@ PROVIDER_MODELS сопоставляет провайдеров ИИ (OpenaiChat
 
 Запуск бота:
 
-python bot.py
+python major.py
 
 Бот начинает опрос и ожидает команды и сообщения.
 
