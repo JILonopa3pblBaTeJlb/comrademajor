@@ -305,7 +305,7 @@ def main():
     async def text_handler(message: Message):
         text = message.text.strip()
 
-#ПОРОГ СРАБАТЫВАНИЯ, УКАЖИТЕ ВМЕСТО 50 СКОЛЬКО НУЖНО СИМВОЛОВ (ЕСЛИ НУЖНО) 
+#ПОРОГ СРАБАТЫВАНИЯ 50 И БОЛЕЕ СИМВОЛОВ
         if len(text) <= 50:
             return
 
