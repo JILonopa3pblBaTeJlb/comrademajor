@@ -13,6 +13,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile
+from aiogram.exceptions import TelegramBadRequest
 
 BOT_TOKEN = "ВАШ:ТОКЕН"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +131,34 @@ async def call_g4f_model(prompt: str) -> str:
     except Exception as e:
         return f"Ошибка: {str(e)}"
 
+
+
+async def safe_reply(message: Message, text: str, **kwargs):
+    try:
+        return await message.reply(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "REPLY_MESSAGE_NOT_FOUND" in str(e):
+            user_busy.pop(message.from_user.id, None)
+            if message.from_user.id in user_queue:
+                user_queue.remove(message.from_user.id)
+            return None
+        raise
+
+
+async def safe_edit_message_text(bot: Bot, text: str, chat_id: int, message_id: int):
+    try:
+        await bot.edit_message_text(
+            text=text,
+            chat_id=chat_id,
+            message_id=message_id
+        )
+        return True
+    except TelegramBadRequest as e:
+        if "MESSAGE_ID_INVALID" in str(e) or "message to edit not found" in str(e).lower():
+            return False
+        raise    
+    
+
 async def analyze_article(client, text, article_number, article_content, prompt_template):
     try:
         if article_content.startswith("Ошибка"):
@@ -155,17 +184,29 @@ async def process_report_with_prompt2(report: str) -> str:
 def clean_report(report: str) -> str:
     lines = report.split('\n')
     cleaned_lines = [line for line in lines if line.strip() not in ["```markdown", "```"]]
-    return '\n'.join(cleaned_lines)
+    cleaned_text = '\n'.join(cleaned_lines)
+    
+    sponsor_trigger = "---\n\n**Sponsor**"
+    trigger_index = cleaned_text.find(sponsor_trigger)
+    if trigger_index != -1:
+        cleaned_text = cleaned_text[:trigger_index].rstrip()
+    
+    return cleaned_text
 
 async def analyze_text(text, prompt_template, articles, message: Message, bot: Bot):
     if len(text) > 2000:
-        await message.reply("Извините, мы не принимаем тексты длиннее 2000 символов.")
+        await safe_reply(message, "Извините, мы не принимаем тексты длиннее 2000 символов.")
         return None
-    progress_message = await message.reply("Производится лингвистическая экспертиза: [          ] 0%")
+
+    progress_message = await safe_reply(message, "Производится лингвистическая экспертиза: [          ] 0%")
+    if not progress_message:
+        return None  # Сообщение удалено — прерываем процесс
+
     client = Client()
     results = []
     total_articles = len([a for a in articles if not articles[a].startswith("Ошибка")])
     completed = 0
+
     for article_number, article_content in articles.items():
         if article_content.startswith("Ошибка"):
             completed += 1
@@ -177,30 +218,42 @@ async def analyze_text(text, prompt_template, articles, message: Message, bot: B
             progress = int((completed / total_articles) * 100)
             filled = int(progress / 10)
             bar = "█" * filled + " " * (10 - filled)
-            await bot.edit_message_text(
+            ok = await safe_edit_message_text(
+                bot=bot,
                 text=f"Анализ: [{bar}] {progress}%",
                 chat_id=message.chat.id,
                 message_id=progress_message.message_id
             )
-    await bot.edit_message_text(
+            if not ok:
+                user_busy.pop(message.from_user.id, None)
+                if message.from_user.id in user_queue:
+                    user_queue.remove(message.from_user.id)
+                return None
+
+    await safe_edit_message_text(
+        bot=bot,
         text="Экспертиза завешена: [██████████] 100%",
         chat_id=message.chat.id,
         message_id=progress_message.message_id
     )
     await asyncio.sleep(0.5)
-    await bot.edit_message_text(
+    await safe_edit_message_text(
+        bot=bot,
         text="Ожидайте ответа вашего следователя...",
         chat_id=message.chat.id,
         message_id=progress_message.message_id
     )
+
     if not results:
         return "Состава преступления не обнаружено. Но это еще ничего не значит. "
+
     report = "\n".join(results)
     cleaned_report = clean_report(report)
     report_id = str(uuid.uuid4())
     report_file = os.path.join(BASE_DIR, "report.txt")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(cleaned_report)
+
     final_response = await process_report_with_prompt2(cleaned_report)
     return final_response, report_file, report_id
 
@@ -214,34 +267,41 @@ async def analyze_command(message: Message, bot: Bot):
     prompt_file = os.path.join(BASE_DIR, "prompt.txt")
     prompt_template = read_file(prompt_file)
     if "Ошибка" in prompt_template:
-        await message.answer(prompt_template, reply_to_message_id=message.message_id)
+        await safe_reply(message, prompt_template)
         return
+
     articles = load_articles()
     if "error" in articles:
-        await message.answer(articles["error"], reply_to_message_id=message.message_id)
+        await safe_reply(message, articles["error"])
         return
+
     text = message.text.replace("/analyze", "").strip()
     if not text:
-        await message.answer(
-            "Гражданин, отправьте сообщение для анализа не более 2000 символов длиной",
-            reply_to_message_id=message.message_id
+        await safe_reply(
+            message,
+            "Гражданин, отправьте сообщение для анализа не более 2000 символов длиной"
         )
         return
+
     result = await analyze_text(text, prompt_template, articles, message, bot)
     if not result:
         return
+
     if isinstance(result, str):
-        await message.answer(result, reply_to_message_id=message.message_id)
+        await safe_reply(message, result)
         return
+
     final_response, report_file, report_id = result
     MAX_LEN = 4000
-    for part in (final_response[i:i+MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
-        await message.answer(part, reply_to_message_id=message.message_id)
-    await message.answer(
+    for part in (final_response[i:i + MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
+        await safe_reply(message, part)
+
+    await safe_reply(
+        message,
         "Ваша судьба в ваших руках, гражданин.",
-        reply_markup=get_post_analysis_keyboard(),
-        reply_to_message_id=message.message_id
+        reply_markup=get_post_analysis_keyboard()
     )
+
     await bot.send_document(
         chat_id=message.chat.id,
         document=FSInputFile(report_file, filename=f"report_{report_id}.txt"),
@@ -253,28 +313,34 @@ async def text_message(message: Message, bot: Bot):
     prompt_file = os.path.join(BASE_DIR, "prompt.txt")
     prompt_template = read_file(prompt_file)
     if "Ошибка" in prompt_template:
-        await message.answer(prompt_template, reply_to_message_id=message.message_id)
+        await safe_reply(message, prompt_template)
         return
+
     articles = load_articles()
     if "error" in articles:
-        await message.answer(articles["error"], reply_to_message_id=message.message_id)
+        await safe_reply(message, articles["error"])
         return
+
     text = message.text.strip()
     result = await analyze_text(text, prompt_template, articles, message, bot)
     if not result:
         return
+
     if isinstance(result, str):
-        await message.answer(result, reply_to_message_id=message.message_id)
+        await safe_reply(message, result)
         return
+
     final_response, report_file, report_id = result
     MAX_LEN = 4000
-    for part in (final_response[i:i+MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
-        await message.answer(part, reply_to_message_id=message.message_id)
-    await message.answer(
+    for part in (final_response[i:i + MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
+        await safe_reply(message, part)
+
+    await safe_reply(
+        message,
         "Ваша судьба в ваших руках, гражданин.",
-        reply_markup=get_post_analysis_keyboard(),
-        reply_to_message_id=message.message_id
+        reply_markup=get_post_analysis_keyboard()
     )
+
     await bot.send_document(
         chat_id=message.chat.id,
         document=FSInputFile(report_file, filename=f"report_{report_id}.txt"),
@@ -305,7 +371,7 @@ def main():
     async def text_handler(message: Message):
         text = message.text.strip()
 
-#ПОРОГ СРАБАТЫВАНИЯ 50 И БОЛЕЕ СИМВОЛОВ
+#ПОРОГ СРАБАТЫВАНИЯ, УКАЖИТЕ ВМЕСТО 50 СКОЛЬКО НУЖНО СИМВОЛОВ (ЕСЛИ НУЖНО) 
         if len(text) <= 50:
             return
 
@@ -313,33 +379,40 @@ def main():
             prompt_file = os.path.join(BASE_DIR, "prompt.txt")
             prompt_template = read_file(prompt_file)
             if "Ошибка" in prompt_template:
-                await message.reply(prompt_template)
+                await safe_reply(message, prompt_template)
                 return
+
             articles = load_articles()
             if "error" in articles:
-                await message.reply(articles["error"])
+                await safe_reply(message, articles["error"])
                 return
+
+            text = message.text.strip()
             result = await analyze_text(text, prompt_template, articles, message, bot)
             if not result:
                 return
+
             if isinstance(result, str):
-                await message.reply(result)
+                await safe_reply(message, result)
                 return
+
             final_response, report_file, report_id = result
             MAX_LEN = 4000
-            for part in (final_response[i:i+MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
-                await message.reply(part)
-            await message.reply(
+            for part in (final_response[i:i + MAX_LEN] for i in range(0, len(final_response), MAX_LEN)):
+                await safe_reply(message, part)
+
+            await safe_reply(
+                message,
                 "Ваша судьба в ваших руках, гражданин.",
                 reply_markup=get_post_analysis_keyboard()
             )
+
             await bot.send_document(
                 chat_id=message.chat.id,
                 document=FSInputFile(report_file, filename=f"report_{report_id}.txt"),
                 caption="Здесь результаты лингвистической экспертизы.",
                 reply_to_message_id=message.message_id
             )
-
         await handle_with_queue(reply_analyze, message, bot)
 
     @dp.callback_query(lambda c: c.data == "pay_fine")
